@@ -1,0 +1,15 @@
+<resources>
+    <string name="app_name">Argón Truck</string>
+    <string name="nav_map">Cabina GPS</string>
+    <string name="nav_vehicle">Vehículo</string>
+    <string name="nav_routes">Rutas</string>
+    <string name="nav_mexico">32 Estados</string>
+    <string name="nav_argon">ARGÓN API</string>
+    <string name="gps_permission_title">Permiso de ubicación GPS</string>
+    <string name="gps_permission_desc">Argón Truck requiere ubicación precisa para guiado de tractocamiones, alertas anticipadas de gálibo y recálculo automático.</string>
+    <string name="grant_location">Activar GPS</string>
+    <string name="night_mode">Modo Nocturno</string>
+    <string name="screen_off_mode">Pantalla Apagada</string>
+    <string name="voice_guidance">Guía por Voz</string>
+    <string name="simulation_mode_label">MODO SIMULACIÓN GPS</string>
+</resources>

@@ -1,0 +1,6 @@
+{
+  "name": "Argón Truck",
+  "description": "Navegador GPS nativo especializado en transporte de carga pesada y tractocamiones para los 32 estados de México, con perfil dimensional, cartografía verificada, motor de rutas NOM-012 y modo sin conexión.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
