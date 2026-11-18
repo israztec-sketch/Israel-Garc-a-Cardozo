@@ -95,20 +95,64 @@ class ArgonNavigationRepository(
 
     /**
      * Calcula rutas para tractocamión usando:
-     * 1) Red de corredores pesados verificados (siempre disponible offline)
-     * 2) API especializada Valhalla Truck + auditoría Overpass cuando hay internet y !offlineFirst
+     * 1) Coordenadas GPS reales del conductor (si están disponibles) o nodo de origen seleccionado
+     * 2) Red de corredores pesados verificados (siempre disponible offline)
+     * 3) API especializada Valhalla Truck + Google Routes API v2 + auditoría Overpass cuando hay internet
      * Nunca sustituye una ruta de automóvil convencional.
      */
     suspend fun calculateHeavyTruckRoutes(
         originNodeId: String,
         destinationNodeId: String,
         profile: TruckProfile,
-        offlineFirst: Boolean
+        offlineFirst: Boolean,
+        liveOriginPoint: GeoPoint? = null,
+        liveOriginLabel: String? = null
     ): List<TruckRouteOption> = withContext(Dispatchers.IO) {
-        val localRoutes = router.calculateRoutes(originNodeId, destinationNodeId, profile)
+        val effectiveGraphOriginId = if (liveOriginPoint != null) {
+            router.findNearestNode(liveOriginPoint)?.id ?: originNodeId
+        } else {
+            originNodeId
+        }
 
-        val originNode = MexicoFreightCatalog.networkNodes.firstOrNull { it.id == originNodeId }
-        val destNode = MexicoFreightCatalog.networkNodes.firstOrNull { it.id == destinationNodeId }
+        val targetDestId = if (effectiveGraphOriginId == destinationNodeId) {
+            MexicoFreightCatalog.networkNodes.firstOrNull { it.id != effectiveGraphOriginId }?.id ?: destinationNodeId
+        } else {
+            destinationNodeId
+        }
+
+        val localRoutes = router.calculateRoutes(effectiveGraphOriginId, targetDestId, profile).map { route ->
+            if (liveOriginPoint != null && route.waypoints.isNotEmpty()) {
+                val firstWp = route.waypoints.first()
+                val distFromGpsKm = GeoMath.haversineKm(liveOriginPoint, firstWp)
+                val updatedWaypoints = if (distFromGpsKm > 0.05) {
+                    listOf(liveOriginPoint) + route.waypoints
+                } else {
+                    route.waypoints
+                }
+                route.copy(
+                    summary = "Origen GPS Real (${liveOriginLabel ?: "Mi Ubicación"}) · ${route.summary}",
+                    waypoints = updatedWaypoints
+                )
+            } else {
+                route
+            }
+        }
+
+        val catalogOriginNode = MexicoFreightCatalog.networkNodes.firstOrNull { it.id == effectiveGraphOriginId }
+        val originNode = if (liveOriginPoint != null) {
+            RoadNode(
+                id = effectiveGraphOriginId,
+                name = liveOriginLabel?.takeIf { it.isNotBlank() } ?: "Mi Ubicación GPS Actual",
+                stateCode = catalogOriginNode?.stateCode ?: originNodeId,
+                lat = liveOriginPoint.lat,
+                lng = liveOriginPoint.lng,
+                isFreightHub = true,
+                allowsHeavyUturn = true
+            )
+        } else {
+            catalogOriginNode
+        }
+        val destNode = MexicoFreightCatalog.networkNodes.firstOrNull { it.id == targetDestId }
 
         if (offlineFirst || !isNetworkAvailable() || originNode == null || destNode == null) {
             return@withContext localRoutes

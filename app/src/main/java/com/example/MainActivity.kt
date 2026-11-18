@@ -138,6 +138,36 @@ class MainActivity : ComponentActivity() {
                 startActivity(intent)
             }
 
+            fun openDeviceLocationSettings() {
+                runCatching {
+                    startActivity(Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS))
+                }.onFailure {
+                    openAppLocationSettings()
+                }
+            }
+
+            // Al iniciar la app, activar GPS real de inmediato o solicitar el permiso automáticamente
+            androidx.compose.runtime.LaunchedEffect(Unit) {
+                if (uiState.hasLocationPermission) {
+                    viewModel.refreshRealGpsFix()
+                } else {
+                    requestLocationWithAndroidGuideFlow()
+                }
+            }
+
+            val lifecycleOwner = androidx.lifecycle.compose.LocalLifecycleOwner.current
+            DisposableEffect(lifecycleOwner) {
+                val observer = androidx.lifecycle.LifecycleEventObserver { _, event ->
+                    if (event == androidx.lifecycle.Lifecycle.Event.ON_RESUME) {
+                        viewModel.refreshRealGpsFix()
+                    }
+                }
+                lifecycleOwner.lifecycle.addObserver(observer)
+                onDispose {
+                    lifecycleOwner.lifecycle.removeObserver(observer)
+                }
+            }
+
             // Mantener pantalla activa durante conducción o modo pantalla atenuada
             val keepAwake = uiState.navigationStatus == NavigationStatus.NAVIGATING || uiState.screenOffMode
             DisposableEffect(keepAwake) {
@@ -174,14 +204,15 @@ class MainActivity : ComponentActivity() {
                                 },
                                 onDismissPermissionRationale = { viewModel.requestLocationRationale(false) },
                                 onOpenAppSettings = { openAppLocationSettings() },
+                                onOpenDeviceLocationSettings = { openDeviceLocationSettings() },
+                                onRefreshRealGps = viewModel::refreshRealGpsFix,
                                 onDismissProximityWarning = viewModel::dismissProximityWarning,
                                 onRerouteAroundRestrictedPoi = viewModel::rerouteAroundRestrictedPoi,
                                 onStartNavigation = viewModel::startNavigation,
                                 onStopNavigation = viewModel::stopNavigation,
-                                onSimulateDeviation = viewModel::simulateDeviationAndReroute,
+                                onRecalculateFromGps = viewModel::recalculateFromCurrentGps,
                                 onToggleNightMode = viewModel::toggleNightMode,
                                 onToggleVoice = viewModel::toggleVoice,
-                                onToggleSimulationMode = viewModel::toggleSimulationMode,
                                 onToggleScreenOffMode = viewModel::setScreenOffMode,
                                 onOpenRoutes = { navigateTo(ROUTE_RUTAS) },
                                 loadTile = viewModel::loadMapTile
@@ -196,7 +227,11 @@ class MainActivity : ComponentActivity() {
                                 uiState = uiState,
                                 profile = profile,
                                 preferences = preferences,
-                                onSetCorridor = viewModel::setCorridor,
+                                onSetCorridor = { origin, dest ->
+                                    viewModel.setCorridor(origin, dest, useGpsOrigin = false)
+                                },
+                                onSetDestinationFromGps = viewModel::setDestinationFromCurrentGps,
+                                onUseCurrentGpsAsOrigin = viewModel::setUseCurrentGpsAsOrigin,
                                 onSearchQueryChange = viewModel::updateSearchQuery,
                                 onSelectRoute = viewModel::selectRouteOption,
                                 onStartNavigationAndGoToCab = {

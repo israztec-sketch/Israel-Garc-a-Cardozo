@@ -68,6 +68,8 @@ fun RoutesScreen(
     profile: TruckProfile,
     preferences: CockpitPreferences,
     onSetCorridor: (String, String) -> Unit,
+    onSetDestinationFromGps: (String) -> Unit,
+    onUseCurrentGpsAsOrigin: (Boolean) -> Unit,
     onSearchQueryChange: (String) -> Unit,
     onSelectRoute: (TruckRouteOption) -> Unit,
     onStartNavigationAndGoToCab: () -> Unit,
@@ -136,12 +138,31 @@ fun RoutesScreen(
                                     .fillMaxWidth()
                                     .testTag("origin_state_picker")
                             ) {
-                                Text("Origen: ${originState?.code ?: uiState.originCode}")
+                                val originText = if (uiState.useCurrentGpsAsOrigin) {
+                                    "Origen: Mi GPS Real"
+                                } else {
+                                    "Origen: ${originState?.code ?: uiState.originCode}"
+                                }
+                                Text(originText)
                             }
                             DropdownMenu(
                                 expanded = originMenuOpen,
                                 onDismissRequest = { originMenuOpen = false }
                             ) {
+                                DropdownMenuItem(
+                                    text = {
+                                        Text(
+                                            "Mi Ubicación GPS Actual (Tiempo Real)",
+                                            fontWeight = FontWeight.Bold,
+                                            color = colors.accentPrimary
+                                        )
+                                    },
+                                    onClick = {
+                                        originMenuOpen = false
+                                        onUseCurrentGpsAsOrigin(true)
+                                    }
+                                )
+                                HorizontalDivider()
                                 allStates.forEach { st ->
                                     DropdownMenuItem(
                                         text = { Text("${st.code} · ${st.name}") },
@@ -155,7 +176,9 @@ fun RoutesScreen(
                         }
 
                         IconButton(
-                            onClick = { onSetCorridor(uiState.destinationCode, uiState.originCode) }
+                            onClick = {
+                                onSetCorridor(uiState.destinationCode, uiState.originCode)
+                            }
                         ) {
                             Icon(Icons.Default.SwapHoriz, contentDescription = "Invertir corredor")
                         }
@@ -178,7 +201,11 @@ fun RoutesScreen(
                                         text = { Text("${st.code} · ${st.name}") },
                                         onClick = {
                                             destMenuOpen = false
-                                            onSetCorridor(uiState.originCode, st.code)
+                                            if (uiState.useCurrentGpsAsOrigin) {
+                                                onSetDestinationFromGps(st.code)
+                                            } else {
+                                                onSetCorridor(uiState.originCode, st.code)
+                                            }
                                         }
                                     )
                                 }
@@ -190,7 +217,7 @@ fun RoutesScreen(
                         value = uiState.searchQuery,
                         onValueChange = onSearchQueryChange,
                         leadingIcon = { Icon(Icons.Default.Search, contentDescription = null) },
-                        label = { Text("Buscar ciudad, parque industrial o estado") },
+                        label = { Text("Buscar ciudad, parque industrial o estado destino") },
                         singleLine = true,
                         modifier = Modifier
                             .fillMaxWidth()
@@ -206,7 +233,11 @@ fun RoutesScreen(
                                     modifier = Modifier
                                         .fillMaxWidth()
                                         .clickable {
-                                            onSetCorridor(uiState.originCode, place.stateCode)
+                                            if (uiState.useCurrentGpsAsOrigin) {
+                                                onSetDestinationFromGps(place.stateCode)
+                                            } else {
+                                                onSetCorridor(uiState.originCode, place.stateCode)
+                                            }
                                             onSearchQueryChange("")
                                         }
                                 ) {
@@ -219,9 +250,13 @@ fun RoutesScreen(
                         }
                     }
 
-                    // Corredores rápidos de prueba de aceptación
-                    Text("Corredores Logísticos Rápidos:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
+                    // Corredores rápidos desde GPS actual o corredor troncal
+                    Text("Destinos y Corredores Rápidos:", style = MaterialTheme.typography.labelSmall, color = MaterialTheme.colorScheme.onSurfaceVariant)
                     FlowRow(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+                        AssistChip(
+                            onClick = { onUseCurrentGpsAsOrigin(true) },
+                            label = { Text("Desde Mi GPS Actual") }
+                        )
                         AssistChip(onClick = { onSetCorridor("CMX", "QUE") }, label = { Text("CDMX → QRO") })
                         AssistChip(onClick = { onSetCorridor("CMX", "NLE") }, label = { Text("CDMX → MTY") })
                         AssistChip(onClick = { onSetCorridor("CMX", "VER") }, label = { Text("CDMX → VER (Maltrata)") })

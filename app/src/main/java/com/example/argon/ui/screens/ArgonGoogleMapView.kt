@@ -203,8 +203,8 @@ fun ArgonGoogleMapView(
             .build()
     }
 
-    LaunchedEffect(location.lat, location.lng, zoomLevel, followTruck) {
-        if (followTruck && mapReady) {
+    LaunchedEffect(location.lat, location.lng, zoomLevel, followTruck, centerOverride, mapReady) {
+        if ((followTruck || centerOverride != null) && mapReady) {
             runCatching {
                 cameraPositionState.animate(
                     update = CameraUpdateFactory.newCameraPosition(

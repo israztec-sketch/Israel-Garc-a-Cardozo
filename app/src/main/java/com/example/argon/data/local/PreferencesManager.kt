@@ -14,7 +14,7 @@ data class CockpitPreferences(
     val nightMode: Boolean = false,
     val darkCockpit: Boolean = true,
     val voiceEnabled: Boolean = true,
-    val simulationMode: Boolean = true,
+    val simulationMode: Boolean = false,
     val offlineFirstMode: Boolean = false,
     val lastOriginCode: String = "CMX",
     val lastDestinationCode: String = "QUE"
@@ -36,7 +36,7 @@ class PreferencesManager(private val context: Context) {
             nightMode = prefs[Keys.NIGHT_MODE] ?: false,
             darkCockpit = prefs[Keys.DARK_COCKPIT] ?: true,
             voiceEnabled = prefs[Keys.VOICE_ENABLED] ?: true,
-            simulationMode = prefs[Keys.SIMULATION_MODE] ?: true,
+            simulationMode = false,
             offlineFirstMode = prefs[Keys.OFFLINE_FIRST] ?: false,
             lastOriginCode = prefs[Keys.ORIGIN_CODE] ?: "CMX",
             lastDestinationCode = prefs[Keys.DEST_CODE] ?: "QUE"
@@ -56,7 +56,7 @@ class PreferencesManager(private val context: Context) {
     }
 
     suspend fun setSimulationMode(enabled: Boolean) {
-        context.argonPrefs.edit { it[Keys.SIMULATION_MODE] = enabled }
+        context.argonPrefs.edit { it[Keys.SIMULATION_MODE] = false }
     }
 
     suspend fun setOfflineFirstMode(enabled: Boolean) {

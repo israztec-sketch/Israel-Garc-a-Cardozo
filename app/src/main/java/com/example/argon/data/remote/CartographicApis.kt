@@ -120,6 +120,29 @@ data class NominatimResult(
     val type: String? = null
 )
 
+@JsonClass(generateAdapter = true)
+data class NominatimAddress(
+    val road: String? = null,
+    val highway: String? = null,
+    val suburb: String? = null,
+    val neighbourhood: String? = null,
+    val city: String? = null,
+    val town: String? = null,
+    val village: String? = null,
+    val municipality: String? = null,
+    val county: String? = null,
+    val state: String? = null,
+    @Json(name = "ISO3166-2-lvl4") val isoStateCode: String? = null,
+    val country: String? = null,
+    @Json(name = "country_code") val countryCode: String? = null
+)
+
+@JsonClass(generateAdapter = true)
+data class NominatimReverseResult(
+    @Json(name = "display_name") val displayName: String? = null,
+    val address: NominatimAddress? = null
+)
+
 // --- Google Routes API v2 DTOs ---
 
 @JsonClass(generateAdapter = true)
@@ -256,6 +279,15 @@ interface NominatimApi {
         @Query("limit") limit: Int = 8,
         @Header("User-Agent") userAgent: String = "ArgonGpsTruck/1.0 (Android Heavy Freight)"
     ): List<NominatimResult>
+
+    @GET("reverse")
+    suspend fun reverseGeocode(
+        @Query("lat") lat: Double,
+        @Query("lon") lon: Double,
+        @Query("format") format: String = "jsonv2",
+        @Query("accept-language") language: String = "es",
+        @Header("User-Agent") userAgent: String = "ArgonGpsTruck/1.0 (Android Heavy Freight)"
+    ): NominatimReverseResult
 }
 
 object CartographicApiClient {

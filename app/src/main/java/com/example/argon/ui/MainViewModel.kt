@@ -11,7 +11,6 @@ import com.example.argon.data.local.CockpitPreferences
 import com.example.argon.data.local.TruckProfileEntity
 import com.example.argon.domain.model.GeoPoint
 import com.example.argon.domain.model.GeocodePlace
-import com.example.argon.domain.model.ManeuverType
 import com.example.argon.domain.model.MexicoStateRegion
 import com.example.argon.domain.model.NavigationStatus
 import com.example.argon.domain.model.RestrictionCrossing
@@ -26,14 +25,19 @@ import com.example.argon.domain.model.VerificationStatus
 import com.example.argon.domain.routing.AcceptanceCheckResult
 import com.example.argon.domain.routing.ArgonAcceptanceVerifier
 import com.example.argon.domain.routing.GeoMath
+import com.example.argon.domain.routing.Nom012ComplianceEvaluator
+import com.example.argon.domain.routing.Nom012ViolationDetail
 import com.example.argon.location.LocationAccessLevel
 import com.example.argon.location.LocationProviderStatus
+import kotlin.math.roundToInt
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.flow.combine
@@ -42,13 +46,11 @@ import kotlinx.coroutines.flow.flatMapLatest
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.coroutines.flow.update
-import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
-import kotlin.math.roundToInt
 
 enum class RestrictedPoiAlertSeverity(val label: String) {
-    CRITICAL_LEGAL_BLOCK("RESTRICCIÓN CRÍTICA"),
-    WEIGH_STATION_CHECK("CONTROL DE PESO / BÁSCULA"),
+    CRITICAL_LEGAL_BLOCK("VIOLACIÓN NOM-012 / RESTRICCIÓN CRÍTICA"),
+    WEIGH_STATION_CHECK("CONTROL DE PESO / BÁSCULA SCT"),
     DRIVING_CAUTION("ADVERTENCIA VIAL")
 }
 
@@ -61,12 +63,17 @@ data class RestrictedPoiWarning(
     val detail: String,
     val sourceCitation: String,
     val severity: RestrictedPoiAlertSeverity,
-    val isBridgeOrClearanceHazard: Boolean
+    val isBridgeOrClearanceHazard: Boolean,
+    val isNom012Violation: Boolean = false,
+    val nom012Clause: String = "NOM-012-SCT-2-2017",
+    val nom012Violations: List<Nom012ViolationDetail> = emptyList()
 )
 
 data class ArgonUiState(
     val originCode: String = "CMX",
     val destinationCode: String = "QUE",
+    val useCurrentGpsAsOrigin: Boolean = true,
+    val hasRealGpsFix: Boolean = false,
     val searchQuery: String = "",
     val searchResults: List<GeocodePlace> = emptyList(),
     val isCalculating: Boolean = false,
@@ -83,7 +90,7 @@ data class ArgonUiState(
     val locationAccessLevel: LocationAccessLevel = LocationAccessLevel.DENIED,
     val showLocationRationale: Boolean = false,
     val isPermissionPermanentlyDenied: Boolean = false,
-    val locationProviderStatus: LocationProviderStatus = LocationProviderStatus.SIMULATED,
+    val locationProviderStatus: LocationProviderStatus = LocationProviderStatus.PERMISSION_REQUIRED,
     val activeProximityWarning: RestrictedPoiWarning? = null,
     val isOnline: Boolean = false,
     val downloadingStateCode: String? = null,
@@ -136,10 +143,17 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     val currentLocation = locationController.locationFlow
     val lastVoiceAnnouncement = voice.lastAnnouncement
 
+    private val _nom012AlertEvents = MutableSharedFlow<RestrictedPoiWarning>(
+        replay = 1,
+        extraBufferCapacity = 8
+    )
+    val nom012AlertEvents: SharedFlow<RestrictedPoiWarning> = _nom012AlertEvents.asSharedFlow()
+
     private val _uiState = MutableStateFlow(
         ArgonUiState(
             hasLocationPermission = locationController.hasLocationPermission(),
             locationAccessLevel = locationController.getLocationAccessLevel(),
+            locationProviderStatus = locationController.providerStatus.value,
             isOnline = repo.isNetworkAvailable(),
             offlineStorageKb = offlineStorage.getDownloadedStorageBytes() / 1024L,
             argonJsonPreview = ArgonTelemetryBus.snapshotJson()
@@ -147,24 +161,25 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     )
     val uiState: StateFlow<ArgonUiState> = _uiState.asStateFlow()
 
-    private var simulationJob: Job? = null
     private val dismissedWarningIds = MutableStateFlow<Set<String>>(emptySet())
+    private var initialRealGpsRouteSynced = false
 
     init {
         viewModelScope.launch {
             db.ensureSeeded()
-            refreshCorridorRoute()
-            if (locationController.hasLocationPermission() && !preferences.value.simulationMode) {
+            if (locationController.hasLocationPermission()) {
                 locationController.startRealGpsUpdates()
             }
+            refreshCorridorRoute()
         }
         viewModelScope.launch {
             locationController.providerStatus.collectLatest { status ->
                 _uiState.update { it.copy(locationProviderStatus = status) }
             }
         }
-        // Observador espacial reactivo en Room: consulta restricciones dentro de caja delimitadora
-        // (puentes bajos, pendientes, zonas prohibidas) y registra cruces con la ubicación del usuario.
+        // Capa de lógica NOM-012 en ViewModel: compara reactivamente la ubicación actual del usuario
+        // contra la base de datos de restricciones de Room y dispara eventos de alerta ante posibles
+        // violaciones de la NOM-012-SCT-2-2017 (como altura de puente insuficiente o exceso de peso).
         val nearbyRestrictionsFlow = locationController.locationFlow
             .flatMapLatest { loc ->
                 restrictionRepo.observeRestrictionsCrossingLocation(loc.lat, loc.lng, radiusKm = 5.0)
@@ -178,10 +193,10 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                 activeProfile,
                 dismissedWarningIds
             ) { (loc, nearbyRestrictions), scales, profile, dismissed ->
-                val warning = evaluateProximityWarning(
+                val warning = Nom012ComplianceEvaluator.evaluateProximityAndNom012(
                     currentPoint = GeoPoint(loc.lat, loc.lng),
                     restrictions = nearbyRestrictions,
-                    pois = scales,
+                    weighStations = scales,
                     profile = profile,
                     dismissedIds = dismissed
                 )
@@ -189,8 +204,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
             }
                 .distinctUntilChangedBy { (_, _, warning) -> warning }
                 .collectLatest { (loc, nearbyRestrictions, warning) ->
-                    _uiState.update { it.copy(activeProximityWarning = warning) }
+                    _uiState.update {
+                        it.copy(
+                            activeProximityWarning = warning,
+                            activeAlertBanner = if (warning?.isNom012Violation == true) {
+                                "${warning.nom012Clause}: ${warning.title} a ${warning.distanceMeters}m"
+                            } else {
+                                it.activeAlertBanner
+                            }
+                        )
+                    }
                     if (warning != null) {
+                        if (warning.isNom012Violation || warning.severity == RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK) {
+                            _nom012AlertEvents.tryEmit(warning)
+                        }
                         val matchedRestriction = nearbyRestrictions.firstOrNull { it.id == warning.id }
                         if (matchedRestriction != null) {
                             restrictionRepo.recordCrossingIfNew(
@@ -209,8 +236,13 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                                 )
                             )
                         }
+                        val voiceMessage = if (warning.isNom012Violation) {
+                            "Alerta NOM 012. ${warning.categoryLabel} a ${warning.distanceMeters} metros en ${warning.roadName}: ${warning.title}"
+                        } else {
+                            "${warning.categoryLabel} a ${warning.distanceMeters} metros: ${warning.title}"
+                        }
                         voice.announce(
-                            message = "${warning.categoryLabel} a ${warning.distanceMeters} metros: ${warning.title}",
+                            message = voiceMessage,
                             dedupeKey = "prox_${warning.id}",
                             enabled = preferences.value.voiceEnabled,
                             interrupt = warning.severity == RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK
@@ -220,15 +252,41 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
         viewModelScope.launch {
             locationController.locationFlow.collectLatest { loc ->
-                val st = _uiState.value
-                val route = st.selectedRoute
-                if (st.navigationStatus == NavigationStatus.NAVIGATING && route != null && !loc.isSimulated) {
+                if (!loc.isSimulated) {
                     val currentPt = GeoPoint(loc.lat, loc.lng)
-                    val deviationMeters = GeoMath.minDistanceToPolylineMeters(currentPt, route.waypoints)
-                    if (deviationMeters > 150.0) {
-                        triggerAutomaticReroute(currentPt)
+                    val nearestMxState = MexicoFreightCatalog.all32States.minByOrNull {
+                        GeoMath.haversineKm(currentPt, GeoPoint(it.centerLat, it.centerLng))
+                    }
+                    val isInsideMexico = loc.lat in 14.45..32.73 && loc.lng in -117.15..-86.65
+                    val detectedOriginCode = if (isInsideMexico && nearestMxState != null) {
+                        nearestMxState.code
                     } else {
-                        updateRealtimeProgressFromGps(currentPt, loc.speedKmh, route)
+                        _uiState.value.originCode
+                    }
+
+                    if (!_uiState.value.hasRealGpsFix) {
+                        _uiState.update {
+                            it.copy(
+                                hasRealGpsFix = true,
+                                originCode = if (it.useCurrentGpsAsOrigin) detectedOriginCode else it.originCode
+                            )
+                        }
+                    }
+
+                    if (!initialRealGpsRouteSynced && _uiState.value.useCurrentGpsAsOrigin) {
+                        initialRealGpsRouteSynced = true
+                        refreshCorridorRoute()
+                    }
+
+                    val st = _uiState.value
+                    val route = st.selectedRoute
+                    if (st.navigationStatus == NavigationStatus.NAVIGATING && route != null) {
+                        val deviationMeters = GeoMath.minDistanceToPolylineMeters(currentPt, route.waypoints)
+                        if (deviationMeters > 150.0) {
+                            triggerAutomaticReroute(currentPt)
+                        } else {
+                            updateRealtimeProgressFromGps(currentPt, loc.speedKmh, route)
+                        }
                     }
                 }
                 publishArgonSnapshot()
@@ -241,86 +299,30 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    private fun evaluateProximityWarning(
-        currentPoint: GeoPoint,
-        restrictions: List<RoadRestriction>,
-        pois: List<TruckPoi>,
-        profile: TruckProfile,
-        dismissedIds: Set<String>
+    /**
+     * Evalúa bajo demanda la ubicación indicada (o la ubicación GPS actual) contra las restricciones
+     * almacenadas en Room para detectar violaciones de la NOM-012-SCT-2-2017 y emitir el evento de alerta.
+     */
+    suspend fun evaluateCurrentLocationNom012Compliance(
+        lat: Double = locationController.locationFlow.value.lat,
+        lng: Double = locationController.locationFlow.value.lng
     ): RestrictedPoiWarning? {
-        // 1. Verificar restricciones críticas (puentes bajos, peso excedido, hgv=no, hazmat) dentro de 3.5 km
-        val nearbyCritical = restrictions.mapNotNull { res ->
-            val distMeters = (GeoMath.haversineKm(currentPoint, GeoPoint(res.lat, res.lng)) * 1000.0).roundToInt()
-            if (distMeters > 3500 || res.id in dismissedIds) return@mapNotNull null
-
-            val heightConflict = res.maxHeightMeters != null && res.maxHeightMeters < profile.heightMeters
-            val weightConflict = res.maxWeightTons != null && res.maxWeightTons < profile.grossWeightTons
-            val axleConflict = profile.axleLoadTons != null && res.maxAxleLoadTons != null && res.maxAxleLoadTons < profile.axleLoadTons
-            val hazmatConflict = res.hazmatProhibited && profile.cargoType.isHazmat
-            val missingData = res.verificationStatus != com.example.argon.domain.model.VerificationStatus.VERIFIED_SOURCE
-
-            val isCritical = heightConflict || weightConflict || axleConflict || hazmatConflict || res.hgvProhibited
-            val severity = when {
-                isCritical -> RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK
-                missingData || res.kind == RestrictionKind.DRIVING_ADVISORY -> RestrictedPoiAlertSeverity.DRIVING_CAUTION
-                else -> RestrictedPoiAlertSeverity.DRIVING_CAUTION
+        val nearby = restrictionRepo.findRestrictionsCrossingLocation(lat, lng, radiusKm = 5.0)
+        val scales = pois.value.filter { it.category == TruckPoiCategory.BASCULA }
+        val warning = Nom012ComplianceEvaluator.evaluateProximityAndNom012(
+            currentPoint = GeoPoint(lat, lng),
+            restrictions = nearby,
+            weighStations = scales,
+            profile = activeProfile.value,
+            dismissedIds = dismissedWarningIds.value
+        )
+        if (warning != null) {
+            _uiState.update { it.copy(activeProximityWarning = warning) }
+            if (warning.isNom012Violation || warning.severity == RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK) {
+                _nom012AlertEvents.tryEmit(warning)
             }
-
-            val detail = buildString {
-                append(res.description)
-                if (heightConflict) append(" · Altura vehículo ${profile.heightMeters}m > gálibo ${res.maxHeightMeters}m.")
-                if (weightConflict) append(" · Peso vehículo ${profile.grossWeightTons}t > límite ${res.maxWeightTons}t.")
-                if (res.gradePercent != null && res.gradePercent >= 5.5) append(" · Pendiente ${res.gradePercent}%.")
-            }
-
-            val categoryLabel = when {
-                res.isBridge || res.maxHeightMeters != null || res.maxWeightTons != null -> "Puente / Paso con Restricción"
-                res.gradePercent != null && res.gradePercent >= 5.5 -> "Pendiente Pronunciada (${res.gradePercent}%)"
-                res.isProhibitedZone -> "Zona Prohibida para Carga Pesada"
-                else -> res.kind.label
-            }
-
-            RestrictedPoiWarning(
-                id = res.id,
-                title = res.title,
-                categoryLabel = categoryLabel,
-                roadName = res.roadName,
-                distanceMeters = distMeters,
-                detail = detail,
-                sourceCitation = res.sourceCitation,
-                severity = severity,
-                isBridgeOrClearanceHazard = res.isBridge || res.maxHeightMeters != null
-            )
-        }.minByOrNull {
-            // Priorizar restricciones críticas sobre advertencias informativas
-            (if (it.severity == RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK) 0 else 10_000) + it.distanceMeters
         }
-
-        if (nearbyCritical != null && nearbyCritical.severity == RestrictedPoiAlertSeverity.CRITICAL_LEGAL_BLOCK) {
-            return nearbyCritical
-        }
-
-        // 2. Verificar Básculas SCT en la base de datos dentro de 5.0 km
-        val nearbyScale = pois
-            .filter { it.category == TruckPoiCategory.BASCULA && it.id !in dismissedIds }
-            .mapNotNull { poi ->
-                val distMeters = (GeoMath.haversineKm(currentPoint, GeoPoint(poi.lat, poi.lng)) * 1000.0).roundToInt()
-                if (distMeters > 5000) return@mapNotNull null
-                RestrictedPoiWarning(
-                    id = poi.id,
-                    title = poi.name,
-                    categoryLabel = "Báscula / Control de Peso SCT",
-                    roadName = poi.highwayRef,
-                    distanceMeters = distMeters,
-                    detail = "${poi.details}. Tu unidad registra ${profile.grossWeightTons}t en ${profile.axleCount} ejes.",
-                    sourceCitation = poi.verifiedSource,
-                    severity = RestrictedPoiAlertSeverity.WEIGH_STATION_CHECK,
-                    isBridgeOrClearanceHazard = false
-                )
-            }
-            .minByOrNull { it.distanceMeters }
-
-        return nearbyScale ?: nearbyCritical
+        return warning
     }
 
     fun dismissProximityWarning() {
@@ -383,6 +385,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(showLocationRationale = show) }
     }
 
+    fun refreshRealGpsFix() {
+        val anyGranted = locationController.hasLocationPermission()
+        val level = locationController.getLocationAccessLevel()
+        _uiState.update {
+            it.copy(
+                hasLocationPermission = anyGranted,
+                locationAccessLevel = level
+            )
+        }
+        if (anyGranted) {
+            locationController.startRealGpsUpdates()
+        }
+    }
+
     fun onLocationPermissionResult(
         fineGranted: Boolean,
         coarseGranted: Boolean = fineGranted,
@@ -407,14 +423,12 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                         "Ubicación aproximada activa. Otorga Ubicación Precisa (Fine) para guiado exacto de tractocamión."
                     LocationAccessLevel.DENIED ->
                         if (permanentlyDenied) "Permiso GPS denegado. Habilítalo en Ajustes del sistema para navegación en tiempo real."
-                        else "Permiso de ubicación denegado. Puedes usar Modo Simulación GPS o conceder el permiso."
+                        else "Permiso de ubicación requerido para detectar la posición real de tu tractocamión."
                     LocationAccessLevel.PRECISE_GRANTED -> null
                 }
             )
         }
         if (anyGranted) {
-            simulationJob?.cancel()
-            viewModelScope.launch { prefs.setSimulationMode(false) }
             locationController.startRealGpsUpdates()
         }
     }
@@ -431,17 +445,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         val next = !preferences.value.voiceEnabled
         viewModelScope.launch { prefs.setVoiceEnabled(next) }
         if (next) voice.announce("Guía por voz activada", dedupeKey = "voice_on", enabled = true, interrupt = true)
-    }
-
-    fun toggleSimulationMode() {
-        val next = !preferences.value.simulationMode
-        viewModelScope.launch { prefs.setSimulationMode(next) }
-        if (next) {
-            locationController.stopRealGpsUpdates()
-        } else if (locationController.hasLocationPermission()) {
-            simulationJob?.cancel()
-            locationController.startRealGpsUpdates()
-        }
     }
 
     fun toggleOfflineFirstMode() {
@@ -487,10 +490,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         }
     }
 
-    fun setCorridor(originCode: String, destCode: String) {
-        _uiState.update { it.copy(originCode = originCode, destinationCode = destCode) }
+    fun setUseCurrentGpsAsOrigin(useGps: Boolean) {
+        _uiState.update { it.copy(useCurrentGpsAsOrigin = useGps) }
+        if (useGps) {
+            refreshRealGpsFix()
+        }
+        refreshCorridorRoute()
+    }
+
+    fun setCorridor(originCode: String, destCode: String, useGpsOrigin: Boolean = false) {
+        _uiState.update {
+            it.copy(
+                originCode = originCode,
+                destinationCode = destCode,
+                useCurrentGpsAsOrigin = useGpsOrigin
+            )
+        }
         viewModelScope.launch {
             prefs.setLastCorridor(originCode, destCode)
+            refreshCorridorRoute()
+        }
+    }
+
+    fun setDestinationFromCurrentGps(destCode: String) {
+        _uiState.update {
+            it.copy(
+                destinationCode = destCode,
+                useCurrentGpsAsOrigin = true
+            )
+        }
+        viewModelScope.launch {
+            prefs.setLastCorridor(_uiState.value.originCode, destCode)
             refreshCorridorRoute()
         }
     }
@@ -498,13 +528,23 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
     fun refreshCorridorRoute() {
         val origin = _uiState.value.originCode
         val dest = _uiState.value.destinationCode
-        if (origin == dest) return
+        val useGpsOrigin = _uiState.value.useCurrentGpsAsOrigin
+        if (!useGpsOrigin && origin == dest) return
         val profile = activeProfile.value
         val offlineFirst = preferences.value.offlineFirstMode
+        val loc = locationController.locationFlow.value
+        val liveGpsPoint = if (useGpsOrigin && !loc.isSimulated) {
+            GeoPoint(loc.lat, loc.lng)
+        } else {
+            null
+        }
+        val liveGpsLabel = if (useGpsOrigin && !loc.isSimulated) {
+            loc.currentTown
+        } else {
+            null
+        }
 
         viewModelScope.launch {
-            simulationJob?.cancel()
-            val locationTimestampAtStart = locationController.locationFlow.value.timestampMs
             _uiState.update {
                 it.copy(
                     isCalculating = true,
@@ -512,13 +552,20 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     isOnline = repo.isNetworkAvailable()
                 )
             }
-            val options = repo.calculateHeavyTruckRoutes(origin, dest, profile, offlineFirst)
+            val options = repo.calculateHeavyTruckRoutes(
+                originNodeId = origin,
+                destinationNodeId = dest,
+                profile = profile,
+                offlineFirst = offlineFirst,
+                liveOriginPoint = liveGpsPoint,
+                liveOriginLabel = liveGpsLabel
+            )
             val chosen = options.firstOrNull { it.safetyAudit.isCompatible && it.isPrimary }
                 ?: options.firstOrNull { it.safetyAudit.isCompatible }
 
             val newStatus = if (chosen == null) NavigationStatus.BLOCKED_INCOMPATIBLE else NavigationStatus.READY
             val alert = when {
-                chosen == null -> "No existe ruta legal compatible para ${profile.heightMeters}m / ${profile.grossWeightTons}t entre $origin y $dest."
+                chosen == null -> "No existe ruta legal compatible para ${profile.heightMeters}m / ${profile.grossWeightTons}t hacia $dest."
                 !chosen.safetyAudit.safetyGuaranteed -> "Advertencia: ${chosen.safetyAudit.missingDataWarnings.firstOrNull() ?: "Datos parciales en ruta"}"
                 else -> null
             }
@@ -536,23 +583,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
                     etaRemainingMinutes = chosen?.estimatedMinutes ?: 0,
                     activeAlertBanner = alert
                 )
-            }
-
-            if (chosen != null) {
-                val firstPt = chosen.waypoints.firstOrNull()
-                val telemetryUnchanged = locationController.locationFlow.value.timestampMs == locationTimestampAtStart
-                if (firstPt != null && preferences.value.simulationMode && telemetryUnchanged) {
-                    val secondPt = chosen.waypoints.getOrElse(1) { firstPt }
-                    locationController.publishSimulatedTelemetry(
-                        lat = firstPt.lat,
-                        lng = firstPt.lng,
-                        speedKmh = 0.0,
-                        bearingDeg = GeoMath.bearingDegrees(firstPt, secondPt),
-                        roadName = firstMan?.roadName ?: chosen.label,
-                        town = firstMan?.townName ?: origin,
-                        stateCode = origin
-                    )
-                }
             }
             publishArgonSnapshot()
         }
@@ -593,7 +623,7 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         _uiState.update { it.copy(navigationStatus = NavigationStatus.NAVIGATING, currentManeuverIndex = 0) }
         val first = route.maneuvers.firstOrNull()
         val msg = buildString {
-            append("Iniciando navegación para tractocamión. ")
+            append("Iniciando navegación GPS en tiempo real para tractocamión. ")
             if (!route.safetyAudit.safetyGuaranteed) {
                 append("Precaución: algunos tramos no tienen dato verificado de gálibo o peso. ")
             }
@@ -602,130 +632,37 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         voice.announce(msg, dedupeKey = "start_${route.id}", enabled = preferences.value.voiceEnabled, interrupt = true)
         publishArgonSnapshot()
 
-        if (preferences.value.simulationMode) {
-            startSimulatedDrive(route)
-        } else if (locationController.hasLocationPermission()) {
+        if (locationController.hasLocationPermission()) {
             locationController.startRealGpsUpdates()
         }
     }
 
     fun stopNavigation() {
-        simulationJob?.cancel()
         _uiState.update { it.copy(navigationStatus = NavigationStatus.IDLE, screenOffMode = false) }
         publishArgonSnapshot()
     }
 
     /**
-     * Simula avance realista paso a paso por los waypoints y maniobras del tractocamión.
+     * Recalcula la ruta pesada inmediatamente desde la posición GPS real del tractocamión.
      */
-    private fun startSimulatedDrive(route: TruckRouteOption) {
-        simulationJob?.cancel()
-        val pts = route.waypoints
-        if (pts.size < 2) return
-        simulationJob = viewModelScope.launch {
-            val totalSteps = (pts.size - 1).coerceAtLeast(1)
-            for (i in 0 until totalSteps) {
-                if (!isActive) break
-                val from = pts[i]
-                val to = pts[i + 1]
-                val subSteps = 4
-                for (s in 0 until subSteps) {
-                    if (_uiState.value.navigationStatus != NavigationStatus.NAVIGATING) return@launch
-                    val t = s.toDouble() / subSteps
-                    val lat = from.lat + (to.lat - from.lat) * t
-                    val lng = from.lng + (to.lng - from.lng) * t
-                    val progress = (i + t) / totalSteps.toDouble()
-                    val manIdx = (progress * (route.maneuvers.size - 1)).toInt().coerceIn(0, route.maneuvers.lastIndex)
-                    val maneuver = route.maneuvers[manIdx]
-                    val remKm = ((1.0 - progress) * route.distanceKm * 10.0).roundToInt() / 10.0
-                    val etaMin = ((1.0 - progress) * route.estimatedMinutes).roundToInt().coerceAtLeast(1)
-                    val bearing = GeoMath.bearingDegrees(from, to)
-
-                    locationController.publishSimulatedTelemetry(
-                        lat = lat,
-                        lng = lng,
-                        speedKmh = 78.0,
-                        bearingDeg = bearing,
-                        roadName = maneuver.roadName,
-                        town = maneuver.townName,
-                        stateCode = route.passedStates.firstOrNull() ?: "MX"
-                    )
-
-                    val alertText = maneuver.curveAdvisory
-                        ?: route.safetyAudit.legalRestrictionsFound.firstOrNull {
-                            GeoMath.haversineKm(GeoPoint(lat, lng), GeoPoint(it.lat, it.lng)) < 35.0
-                        }?.title
-
-                    _uiState.update {
-                        it.copy(
-                            currentManeuverIndex = manIdx,
-                            distanceToNextManeuverMeters = (maneuver.distanceMeters * (1.0 - (progress * 3 % 1.0))).coerceAtLeast(150.0),
-                            remainingDistanceKm = remKm,
-                            etaRemainingMinutes = etaMin,
-                            activeAlertBanner = alertText
-                        )
-                    }
-
-                    // Anuncios anticipados de curvas, salidas o restricciones
-                    val voiceCue = when {
-                        maneuver.curveAdvisory != null -> "Atención: ${maneuver.curveAdvisory} en ${maneuver.roadName}"
-                        maneuver.type == ManeuverType.TOLL_BOOTH -> "Caseta de cobro próxima en ${maneuver.roadName}"
-                        maneuver.type == ManeuverType.EXIT_HIGHWAY -> "Salida próxima hacia ${maneuver.roadName}"
-                        else -> maneuver.instruction
-                    }
-                    voice.announce(voiceCue, dedupeKey = "man_${route.id}_$manIdx", enabled = preferences.value.voiceEnabled)
-                    publishArgonSnapshot()
-                    delay(1400L)
-                }
-            }
-            _uiState.update {
-                it.copy(
-                    navigationStatus = NavigationStatus.ARRIVED,
-                    remainingDistanceKm = 0.0,
-                    etaRemainingMinutes = 0,
-                    activeAlertBanner = "Llegada al destino logístico completada"
-                )
-            }
-            voice.announce("Has llegado a tu destino de carga pesada.", dedupeKey = "arrived_${route.id}", enabled = preferences.value.voiceEnabled, interrupt = true)
-            publishArgonSnapshot()
-        }
-    }
-
-    /**
-     * Prueba / ejecuta recálculo automático ante desvío del tractocamión (Regla 10).
-     */
-    fun simulateDeviationAndReroute() {
-        val currentDest = _uiState.value.destinationCode
-        val profile = activeProfile.value
-        simulationJob?.cancel()
-        viewModelScope.launch {
-            _uiState.update {
-                it.copy(
-                    navigationStatus = NavigationStatus.REROUTING,
-                    activeAlertBanner = "Desvío detectado (>150m). Recalculando corredor pesado..."
-                )
-            }
-            voice.announce(
-                "Desvío detectado. Recalculando ruta compatible para tractocamión sin calles residenciales.",
-                dedupeKey = "reroute_${System.currentTimeMillis()}",
-                enabled = preferences.value.voiceEnabled,
-                interrupt = true
+    fun recalculateFromCurrentGps() {
+        refreshRealGpsFix()
+        val loc = locationController.locationFlow.value
+        val currentPt = GeoPoint(loc.lat, loc.lng)
+        _uiState.update {
+            it.copy(
+                useCurrentGpsAsOrigin = true,
+                navigationStatus = NavigationStatus.REROUTING,
+                activeAlertBanner = "Recalculando corredor pesado desde tu posición GPS actual..."
             )
-            publishArgonSnapshot()
-            delay(700L)
-            // Simulamos posición desviada hacia Enlace Arco Norte Tula
-            val deviatedPt = GeoPoint(20.0520, -99.3410)
-            locationController.publishSimulatedTelemetry(
-                lat = deviatedPt.lat,
-                lng = deviatedPt.lng,
-                speedKmh = 64.0,
-                bearingDeg = 300f,
-                roadName = "Enlace Arco Norte Tula (Desvío)",
-                town = "Tula de Allende, Hgo.",
-                stateCode = "HID"
-            )
-            triggerAutomaticReroute(deviatedPt, currentDest, profile)
         }
+        voice.announce(
+            "Recalculando ruta compatible para tractocamión desde tu ubicación GPS actual.",
+            dedupeKey = "reroute_${System.currentTimeMillis()}",
+            enabled = preferences.value.voiceEnabled,
+            interrupt = true
+        )
+        triggerAutomaticReroute(currentPt)
     }
 
     private fun triggerAutomaticReroute(
@@ -733,34 +670,46 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
         destCode: String = _uiState.value.destinationCode,
         profile: TruckProfile = activeProfile.value
     ) {
-        val rerouted = repo.router.recalculateFromLocation(deviatedPoint, destCode, profile)
-        if (rerouted != null && rerouted.safetyAudit.isCompatible) {
-            _uiState.update {
-                it.copy(
-                    selectedRoute = rerouted,
-                    routeOptions = listOf(rerouted) + it.routeOptions.filter { r -> r.id != rerouted.id },
-                    navigationStatus = NavigationStatus.NAVIGATING,
-                    currentManeuverIndex = 0,
-                    distanceToNextManeuverMeters = rerouted.maneuvers.firstOrNull()?.distanceMeters ?: 0.0,
-                    remainingDistanceKm = rerouted.distanceKm,
-                    etaRemainingMinutes = rerouted.estimatedMinutes,
-                    activeAlertBanner = "Ruta recalculada: ${rerouted.summary}"
-                )
-            }
-            voice.announce(
-                "Nueva ruta segura calculada: ${rerouted.distanceKm} kilómetros.",
-                dedupeKey = "reroute_done_${rerouted.id}",
-                enabled = preferences.value.voiceEnabled
+        viewModelScope.launch {
+            val options = repo.calculateHeavyTruckRoutes(
+                originNodeId = _uiState.value.originCode,
+                destinationNodeId = destCode,
+                profile = profile,
+                offlineFirst = preferences.value.offlineFirstMode,
+                liveOriginPoint = deviatedPoint,
+                liveOriginLabel = locationController.locationFlow.value.currentTown
             )
-        } else {
-            _uiState.update {
-                it.copy(
-                    navigationStatus = NavigationStatus.BLOCKED_INCOMPATIBLE,
-                    activeAlertBanner = "Alerta: No se encontró retorno o corredor seguro tras el desvío."
+            val rerouted = options.firstOrNull { it.safetyAudit.isCompatible }
+                ?: repo.router.recalculateFromLocation(deviatedPoint, destCode, profile)
+
+            if (rerouted != null && rerouted.safetyAudit.isCompatible) {
+                _uiState.update {
+                    it.copy(
+                        selectedRoute = rerouted,
+                        routeOptions = listOf(rerouted) + options.filter { r -> r.id != rerouted.id },
+                        navigationStatus = NavigationStatus.NAVIGATING,
+                        currentManeuverIndex = 0,
+                        distanceToNextManeuverMeters = rerouted.maneuvers.firstOrNull()?.distanceMeters ?: 0.0,
+                        remainingDistanceKm = rerouted.distanceKm,
+                        etaRemainingMinutes = rerouted.estimatedMinutes,
+                        activeAlertBanner = "Ruta recalculada desde GPS: ${rerouted.summary}"
+                    )
+                }
+                voice.announce(
+                    "Nueva ruta segura calculada desde tu posición GPS: ${rerouted.distanceKm} kilómetros.",
+                    dedupeKey = "reroute_done_${rerouted.id}",
+                    enabled = preferences.value.voiceEnabled
                 )
+            } else {
+                _uiState.update {
+                    it.copy(
+                        navigationStatus = NavigationStatus.BLOCKED_INCOMPATIBLE,
+                        activeAlertBanner = "Alerta: No se encontró retorno o corredor seguro hacia $destCode."
+                    )
+                }
             }
+            publishArgonSnapshot()
         }
-        publishArgonSnapshot()
     }
 
     fun downloadOfflineState(stateCode: String) {
@@ -892,7 +841,6 @@ class MainViewModel(application: Application) : AndroidViewModel(application) {
 
     override fun onCleared() {
         super.onCleared()
-        simulationJob?.cancel()
         locationController.stopRealGpsUpdates()
     }
 }

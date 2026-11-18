@@ -115,9 +115,63 @@ class ArgonTruckAcceptanceTest {
             shouldShowRationaleAfterDeny = false
         )
         assertTrue(vm.uiState.value.hasLocationPermission)
+        assertTrue(vm.uiState.value.useCurrentGpsAsOrigin)
+        assertEquals(false, vm.preferences.value.simulationMode)
         assertEquals(
             com.example.argon.location.LocationAccessLevel.PRECISE_GRANTED,
             vm.uiState.value.locationAccessLevel
+        )
+
+        // 4. Verificar configuración activa de FusedLocationProviderClient con PRIORITY_HIGH_ACCURACY
+        val request = app.locationController.buildActiveHighAccuracyRequest()
+        assertEquals(com.google.android.gms.location.Priority.PRIORITY_HIGH_ACCURACY, request.priority)
+        assertEquals(1000L, request.intervalMillis)
+        assertEquals(500L, request.minUpdateIntervalMillis)
+        assertEquals(1000L, request.maxUpdateDelayMillis)
+        assertEquals(0f, request.minUpdateDistanceMeters, 0.001f)
+
+        // 5. Verificar rechazo de ubicaciones mock / emulador y aceptación de GPS real
+        val mockLocation = android.location.Location("gps").apply {
+            latitude = 20.5888
+            longitude = -100.3899
+            isMock = true
+        }
+        assertTrue(app.locationController.isMockOrEmulatorLocation(mockLocation))
+
+        val emulatorProviderLoc = android.location.Location("emulator_mock_provider").apply {
+            latitude = 25.6866
+            longitude = -100.3161
+            isMock = false
+        }
+        assertTrue(app.locationController.isMockOrEmulatorLocation(emulatorProviderLoc))
+
+        assertTrue(
+            com.example.argon.location.TruckLocationController.isMockOrEmulatorData(
+                lat = 37.4219983,
+                lng = -122.084,
+                isMockFlag = false,
+                hasMockExtra = false,
+                providerName = "fused",
+                isEmulatorBuild = true
+            )
+        )
+
+        val realGpsLocation = android.location.Location(android.location.LocationManager.GPS_PROVIDER).apply {
+            latitude = 20.5888
+            longitude = -100.3899
+            accuracy = 4.5f
+            isMock = false
+        }
+        assertEquals(
+            false,
+            com.example.argon.location.TruckLocationController.isMockOrEmulatorData(
+                lat = realGpsLocation.latitude,
+                lng = realGpsLocation.longitude,
+                isMockFlag = false,
+                hasMockExtra = false,
+                providerName = realGpsLocation.provider,
+                isEmulatorBuild = false
+            )
         )
     }
 
@@ -147,6 +201,15 @@ class ArgonTruckAcceptanceTest {
             bridgeWarning.severity
         )
         assertTrue(bridgeWarning.isBridgeOrClearanceHazard)
+        assertTrue("Debe marcarse como violación a la NOM-012", bridgeWarning.isNom012Violation)
+        assertTrue(bridgeWarning.nom012Clause.contains("NOM-012"))
+        assertTrue(
+            bridgeWarning.nom012Violations.any {
+                it.type == com.example.argon.domain.routing.Nom012ViolationType.INSUFFICIENT_BRIDGE_HEIGHT &&
+                    it.vehicleMetric == "4.20 m" &&
+                    it.allowedLimitMetric == "3.75 m"
+            }
+        )
 
         // 2. Descartar advertencia actual y verificar que se limpia
         vm.dismissProximityWarning()

@@ -61,7 +61,13 @@ fun TruckMapCanvas(
     var internalZoom by remember(zoomLevel) { mutableFloatStateOf(zoomLevel) }
     val tileCache = remember { mutableStateMapOf<String, Bitmap>() }
 
-    val focusPoint = centerOverride ?: GeoPoint(location.lat, location.lng)
+    LaunchedEffect(centerOverride) {
+        if (centerOverride != null) {
+            panOffset = Offset.Zero
+        }
+    }
+
+    val focusPoint = GeoPoint(location.lat, location.lng)
     val tileZ = internalZoom.roundToInt().coerceIn(5, 11)
 
     LaunchedEffect(focusPoint.lat, focusPoint.lng, tileZ) {

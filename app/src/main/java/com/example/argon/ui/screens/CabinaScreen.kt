@@ -15,7 +15,6 @@ import androidx.compose.foundation.layout.heightIn
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
-import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.AltRoute
@@ -46,6 +45,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -66,8 +66,8 @@ import com.example.argon.domain.model.RoadRestriction
 import com.example.argon.domain.model.TelemetryLocation
 import com.example.argon.domain.model.TruckPoi
 import com.example.argon.domain.model.TruckProfile
-import com.example.argon.domain.model.TruckRouteOption
 import com.example.argon.location.LocationAccessLevel
+import com.example.argon.location.LocationProviderStatus
 import com.example.argon.ui.ArgonUiState
 import com.example.argon.ui.RestrictedPoiAlertSeverity
 import com.example.ui.theme.LocalArgonColors
@@ -86,14 +86,15 @@ fun CabinaScreen(
     onConfirmPermissionRationale: () -> Unit,
     onDismissPermissionRationale: () -> Unit,
     onOpenAppSettings: () -> Unit,
+    onOpenDeviceLocationSettings: () -> Unit,
+    onRefreshRealGps: () -> Unit,
     onDismissProximityWarning: () -> Unit,
     onRerouteAroundRestrictedPoi: () -> Unit,
     onStartNavigation: () -> Unit,
     onStopNavigation: () -> Unit,
-    onSimulateDeviation: () -> Unit,
+    onRecalculateFromGps: () -> Unit,
     onToggleNightMode: () -> Unit,
     onToggleVoice: () -> Unit,
-    onToggleSimulationMode: () -> Unit,
     onToggleScreenOffMode: (Boolean) -> Unit,
     onOpenRoutes: () -> Unit,
     loadTile: suspend (Int, Int, Int) -> Bitmap?,
@@ -101,11 +102,18 @@ fun CabinaScreen(
 ) {
     val colors = LocalArgonColors.current
     val googleMapsConfigured = remember { hasConfiguredMapsApiKey() }
-    var zoomLevel by remember { mutableFloatStateOf(if (!preferences.offlineFirstMode && googleMapsConfigured) 11.5f else 7.0f) }
+    var zoomLevel by remember { mutableFloatStateOf(if (!preferences.offlineFirstMode && googleMapsConfigured) 12.5f else 8.0f) }
     var recenterTrigger by remember { mutableStateOf<GeoPoint?>(null) }
     var followTruck by remember { mutableStateOf(true) }
     var useGoogleMaps by remember(preferences.offlineFirstMode, googleMapsConfigured) {
         mutableStateOf(!preferences.offlineFirstMode && googleMapsConfigured)
+    }
+
+    // Centrar mapa automáticamente en cuanto llegue la posición GPS real del dispositivo
+    LaunchedEffect(uiState.hasRealGpsFix, location.lat, location.lng) {
+        if (!location.isSimulated && followTruck) {
+            recenterTrigger = GeoPoint(location.lat, location.lng)
+        }
     }
 
     if (uiState.screenOffMode) {
@@ -137,7 +145,6 @@ fun CabinaScreen(
                 modifier = Modifier.fillMaxSize()
             )
         } else {
-            // Mapa vectorial y teselas cacheadas para operación 100% sin internet
             TruckMapCanvas(
                 location = location,
                 selectedRoute = uiState.selectedRoute,
@@ -151,7 +158,7 @@ fun CabinaScreen(
             )
         }
 
-        // HUD Superior: Maniobra, Escudo Carretero, Población y Alertas
+        // HUD Superior: Maniobra, Escudo Carretero, Población y Estado Real de GPS
         Column(
             modifier = Modifier
                 .align(Alignment.TopCenter)
@@ -176,7 +183,7 @@ fun CabinaScreen(
                                 shape = RoundedCornerShape(8.dp)
                             ) {
                                 Text(
-                                    text = currentManeuver?.highwayShield ?: "MEX",
+                                    text = currentManeuver?.highwayShield ?: "GPS",
                                     style = MaterialTheme.typography.labelLarge,
                                     color = Color.Black,
                                     modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp)
@@ -205,7 +212,7 @@ fun CabinaScreen(
 
                     Spacer(modifier = Modifier.height(6.dp))
                     Text(
-                        text = currentManeuver?.instruction ?: "Selecciona corredor en Rutas para iniciar guiado pesado",
+                        text = currentManeuver?.instruction ?: "Selecciona destino en Rutas para iniciar guiado pesado desde tu GPS",
                         style = MaterialTheme.typography.titleMedium,
                         color = MaterialTheme.colorScheme.onSurface,
                         maxLines = 2,
@@ -219,73 +226,80 @@ fun CabinaScreen(
                     ) {
                         Column(modifier = Modifier.weight(1f)) {
                             Text(
-                                text = "Zona: ${location.currentTown} (${location.currentStateCode})",
+                                text = if (!location.isSimulated) {
+                                    "Posición: ${location.currentTown} (${location.currentStateCode})"
+                                } else {
+                                    "Detectando señal GPS del dispositivo..."
+                                },
                                 style = MaterialTheme.typography.bodyMedium,
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                                 maxLines = 1,
                                 overflow = TextOverflow.Ellipsis
                             )
                             Text(
-                                text = String.format(
-                                    java.util.Locale.US,
-                                    "%.4f, %.4f · ±%.0fm",
-                                    location.lat,
-                                    location.lng,
-                                    location.accuracyMeters
-                                ),
+                                text = when {
+                                    !location.isSimulated ->
+                                        String.format(
+                                            java.util.Locale.US,
+                                            "GPS Real: %.5f, %.5f · ±%.0fm · %s",
+                                            location.lat,
+                                            location.lng,
+                                            location.accuracyMeters,
+                                            location.currentRoadName
+                                        )
+                                    uiState.locationProviderStatus == LocationProviderStatus.MOCK_OR_EMULATOR_IGNORED ->
+                                        "Proveedor mock/emulador ignorado · Esperando señal GPS real..."
+                                    else ->
+                                        "Esperando coordenadas reales de FusedLocationProviderClient (HIGH_ACCURACY)..."
+                                },
                                 style = MaterialTheme.typography.labelSmall,
-                                color = colors.accentSecondary
+                                color = colors.accentSecondary,
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
                             )
                         }
-                        if (preferences.simulationMode) {
-                            Surface(
-                                color = colors.warningAmber.copy(alpha = 0.2f),
-                                shape = RoundedCornerShape(6.dp),
-                                modifier = Modifier
-                                    .clickable {
-                                        if (!uiState.hasLocationPermission) onRequestGpsPermission()
-                                        else onToggleSimulationMode()
-                                    }
-                                    .testTag("gps_mode_badge")
-                            ) {
-                                Text(
-                                    text = "SIMULACIÓN GPS",
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = colors.warningAmber,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                                )
-                            }
-                        } else {
-                            val gpsBadgeColor = when (uiState.locationAccessLevel) {
-                                LocationAccessLevel.PRECISE_GRANTED -> colors.safeGreen
-                                LocationAccessLevel.APPROXIMATE_ONLY -> colors.warningAmber
-                                LocationAccessLevel.DENIED -> colors.dangerRed
-                            }
-                            Surface(
-                                color = gpsBadgeColor.copy(alpha = 0.2f),
-                                shape = RoundedCornerShape(6.dp),
-                                modifier = Modifier
-                                    .clickable {
-                                        when {
-                                            uiState.isPermissionPermanentlyDenied -> onOpenAppSettings()
-                                            uiState.locationAccessLevel != LocationAccessLevel.PRECISE_GRANTED -> onRequestGpsPermission()
-                                            else -> onToggleSimulationMode()
+
+                        val gpsBadgeColor = when {
+                            uiState.locationProviderStatus == LocationProviderStatus.GPS_DISABLED -> colors.dangerRed
+                            uiState.locationProviderStatus == LocationProviderStatus.MOCK_OR_EMULATOR_IGNORED -> colors.warningAmber
+                            uiState.locationAccessLevel == LocationAccessLevel.PRECISE_GRANTED && !location.isSimulated -> colors.safeGreen
+                            uiState.locationAccessLevel == LocationAccessLevel.PRECISE_GRANTED -> colors.warningAmber
+                            uiState.locationAccessLevel == LocationAccessLevel.APPROXIMATE_ONLY -> colors.warningAmber
+                            else -> colors.dangerRed
+                        }
+
+                        Surface(
+                            color = gpsBadgeColor.copy(alpha = 0.2f),
+                            shape = RoundedCornerShape(6.dp),
+                            modifier = Modifier
+                                .clickable {
+                                    when {
+                                        uiState.isPermissionPermanentlyDenied -> onOpenAppSettings()
+                                        uiState.locationAccessLevel != LocationAccessLevel.PRECISE_GRANTED -> onRequestGpsPermission()
+                                        uiState.locationProviderStatus == LocationProviderStatus.GPS_DISABLED -> onOpenDeviceLocationSettings()
+                                        else -> {
+                                            onRefreshRealGps()
+                                            followTruck = true
+                                            recenterTrigger = GeoPoint(location.lat, location.lng)
                                         }
                                     }
-                                    .testTag("gps_mode_badge")
-                            ) {
-                                Text(
-                                    text = when {
-                                        uiState.isPermissionPermanentlyDenied -> "ABRIR AJUSTES GPS"
-                                        uiState.locationAccessLevel == LocationAccessLevel.DENIED -> "ACTIVAR GPS PRECISO"
-                                        uiState.locationAccessLevel == LocationAccessLevel.APPROXIMATE_ONLY -> "MEJORAR A PRECISO"
-                                        else -> uiState.locationProviderStatus.label
-                                    },
-                                    style = MaterialTheme.typography.labelSmall,
-                                    color = gpsBadgeColor,
-                                    modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
-                                )
-                            }
+                                }
+                                .testTag("gps_mode_badge")
+                        ) {
+                            Text(
+                                text = when {
+                                    uiState.isPermissionPermanentlyDenied -> "ABRIR AJUSTES PERMISO"
+                                    uiState.locationAccessLevel == LocationAccessLevel.DENIED -> "CONCEDER PERMISO GPS"
+                                    uiState.locationProviderStatus == LocationProviderStatus.GPS_DISABLED -> "ENCENDER GPS DISPOSITIVO"
+                                    uiState.locationAccessLevel == LocationAccessLevel.APPROXIMATE_ONLY -> "MEJORAR A GPS PRECISO"
+                                    uiState.locationProviderStatus == LocationProviderStatus.MOCK_OR_EMULATOR_IGNORED -> "MOCK/EMULADOR IGNORADO"
+                                    !location.isSimulated -> "GPS EN VIVO ACTIVO"
+                                    else -> uiState.locationProviderStatus.label
+                                },
+                                style = MaterialTheme.typography.labelSmall,
+                                color = gpsBadgeColor,
+                                modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp)
+                            )
                         }
                     }
                 }
@@ -297,7 +311,7 @@ fun CabinaScreen(
                     title = { Text("Ubicación Precisa (Fine Location)") },
                     text = {
                         Text(
-                            "Argón Truck necesita acceso a ubicación precisa en primer plano para calcular la posición exacta del tractocamión en carreteras federales, anticipar puentes de gálibo bajo, básculas SCT y recalcular la ruta ante desvíos."
+                            "Argón Truck necesita acceso a ubicación precisa en primer plano para detectar la posición GPS real de tu tractocamión, calcular rutas desde tu ubicación actual, anticipar puentes bajos, básculas SCT y recalcular ante desvíos."
                         )
                     },
                     confirmButton = {
@@ -353,7 +367,7 @@ fun CabinaScreen(
             }
         }
 
-        // Botonera lateral derecha: Zoom, Modo Nocturno, Voz, Pantalla Apagada, GPS
+        // Botonera lateral derecha: Zoom, Modo Nocturno, Voz, Pantalla Apagada, GPS Real
         Column(
             modifier = Modifier
                 .align(Alignment.CenterEnd)
@@ -374,13 +388,19 @@ fun CabinaScreen(
             }
             FilledTonalIconButton(
                 onClick = {
-                    followTruck = true
-                    recenterTrigger = GeoPoint(location.lat, location.lng)
-                    if (!uiState.hasLocationPermission) onRequestGpsPermission()
+                    when {
+                        !uiState.hasLocationPermission -> onRequestGpsPermission()
+                        uiState.locationProviderStatus == LocationProviderStatus.GPS_DISABLED -> onOpenDeviceLocationSettings()
+                        else -> {
+                            onRefreshRealGps()
+                            followTruck = true
+                            recenterTrigger = GeoPoint(location.lat, location.lng)
+                        }
+                    }
                 },
                 modifier = Modifier.testTag("recenter_gps_btn")
             ) {
-                Icon(Icons.Default.GpsFixed, contentDescription = "Centrar en camión")
+                Icon(Icons.Default.GpsFixed, contentDescription = "Centrar en mi GPS real")
             }
             FilledTonalIconButton(
                 onClick = { useGoogleMaps = !useGoogleMaps },
@@ -425,7 +445,7 @@ fun CabinaScreen(
             }
         }
 
-        // Panel inferior de Telemetría, ETA, Distancia Restante y Controles de Conducción
+        // Panel inferior de Telemetría, ETA, Distancia Restante y Controles de Conducción Real
         Card(
             colors = CardDefaults.cardColors(containerColor = colors.panelSurface.copy(alpha = 0.96f)),
             shape = RoundedCornerShape(topStart = 20.dp, topEnd = 20.dp),
@@ -474,15 +494,15 @@ fun CabinaScreen(
                             Text("Detener")
                         }
                         OutlinedButton(
-                            onClick = onSimulateDeviation,
+                            onClick = onRecalculateFromGps,
                             modifier = Modifier
                                 .weight(1f)
                                 .height(48.dp)
-                                .testTag("simulate_reroute_button")
+                                .testTag("recalculate_gps_button")
                         ) {
                             Icon(Icons.AutoMirrored.Filled.AltRoute, contentDescription = null)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Simular Desvío")
+                            Text("Recalcular GPS")
                         }
                     } else {
                         Button(
@@ -507,7 +527,8 @@ fun CabinaScreen(
                         ) {
                             Icon(Icons.Default.Route, contentDescription = null)
                             Spacer(modifier = Modifier.width(6.dp))
-                            Text("Corredor ${uiState.originCode}→${uiState.destinationCode}")
+                            val originLabel = if (uiState.useCurrentGpsAsOrigin) "Mi GPS" else uiState.originCode
+                            Text("$originLabel → ${uiState.destinationCode}")
                         }
                     }
                 }
@@ -541,6 +562,11 @@ fun CabinaScreen(
                             )
                         }
                         Text(
+                            text = warning.nom012Clause,
+                            style = MaterialTheme.typography.labelSmall,
+                            color = colors.accentSecondary
+                        )
+                        Text(
                             text = warning.title,
                             style = MaterialTheme.typography.titleMedium.copy(fontWeight = FontWeight.Bold),
                             color = accentColor
@@ -559,6 +585,38 @@ fun CabinaScreen(
                             style = MaterialTheme.typography.bodyMedium.copy(fontWeight = FontWeight.SemiBold),
                             color = colors.accentSecondary
                         )
+                        if (warning.nom012Violations.isNotEmpty()) {
+                            warning.nom012Violations.forEach { v ->
+                                Surface(
+                                    color = accentColor.copy(alpha = 0.12f),
+                                    shape = RoundedCornerShape(8.dp),
+                                    modifier = Modifier
+                                        .fillMaxWidth()
+                                        .testTag("nom012_violation_card")
+                                ) {
+                                    Column(
+                                        modifier = Modifier.padding(10.dp),
+                                        verticalArrangement = Arrangement.spacedBy(2.dp)
+                                    ) {
+                                        Text(
+                                            text = v.type.title,
+                                            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.Bold),
+                                            color = accentColor
+                                        )
+                                        Text(
+                                            text = "Tu unidad: ${v.vehicleMetric}  |  Límite: ${v.allowedLimitMetric}",
+                                            style = MaterialTheme.typography.bodySmall,
+                                            color = MaterialTheme.colorScheme.onSurface
+                                        )
+                                        Text(
+                                            text = "Exceso detectado: ${v.excessMetric}",
+                                            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+                                            color = accentColor
+                                        )
+                                    }
+                                }
+                            }
+                        }
                         Text(
                             text = warning.detail,
                             style = MaterialTheme.typography.bodyMedium,
